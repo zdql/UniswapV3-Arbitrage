@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Copy, Clone)]
 enum Token {
     Eth,
     Dai,
@@ -90,20 +90,7 @@ fn calc_two_pool_arb_profit(x_in: f64, xr1: f64, xr2: f64, yr1: f64, yr2: f64, f
     n / d
 }
 
-// fn calc_two_pool_arb_optimal_amount(
-//     xr1: f64,
-//     xr2: f64,
-//     yr1: f64,
-//     yr2: f64,
-//     fee: f64,
-// ) -> (f64, f64) {
-//     let n1 = (xr1 * xr2 * yr1 * yr2).sqrt() * fee;
-//     let n2 = yr1 * yr2;
-//     let d = fee * (xr2 + (fee * xr1));
-//     ((n1 - n2) / d, ((-n1) - n2) / d)
-// }
-
-fn detect_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64) -> f64 {
+fn detect_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64, amt_in: f64) -> f64 {
     let is_x_1 = token_in == pool1.token_x;
     let is_x_2 = token_in == pool2.token_x;
 
@@ -111,8 +98,6 @@ fn detect_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64) -> f64 {
     let x2 = *pool2.x.read().unwrap();
     let y1 = *pool1.y.read().unwrap();
     let y2 = *pool2.y.read().unwrap();
-
-    let amt_in = 1.;
 
     let opt_amt = match (is_x_1, is_x_2) {
         (true, true) => calc_two_pool_arb_profit(amt_in, x1, x2, y1, y2, fee),
@@ -124,28 +109,22 @@ fn detect_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64) -> f64 {
     opt_amt
 }
 
+fn find_optimal_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64, max_amt_in: f64) -> f64 {
+    let mut amt = 0.01;
+    let mut max_out = 0.;
+    let mut opt_amt = 0.;
+    while amt <= max_amt_in {
+        let amt_out = detect_arb(pool1, pool2, token_in.clone(), fee, amt) - amt;
+        if amt_out > max_out {
+            max_out = amt_out;
+            opt_amt = amt;
+        }
+        amt += 0.01;
+    }
+    opt_amt
+}
+
 fn main() {
-    let xx = 1000.;
-    let yy = 200.;
-    let kk = xx * yy;
-
-    let mut pool = Pool {
-        token_x: Token::Eth,
-        token_y: Token::Dai,
-        x: RwLock::new(xx),
-        y: RwLock::new(yy),
-        k: RwLock::new(xx + yy),
-    };
-
-    let mut trader = Trader {
-        amt_eth: RwLock::new(xx),
-        amt_dai: RwLock::new(yy),
-    };
-
-    add(&mut pool, 4., 4.);
-
-    swap(&mut trader, &mut pool, Token::Eth, 2., 0.03);
-
     let pool1 = Arc::new(Pool {
         token_x: Token::Eth,
         token_y: Token::Dai,
@@ -162,22 +141,22 @@ fn main() {
         k: RwLock::new(4004.),
     });
 
-    let borrowpool1 = Arc::clone(&pool1);
-    let borrowpool2 = Arc::clone(&pool2);
+    let safepool1 = Arc::clone(&pool1);
+    let safepool2 = Arc::clone(&pool2);
 
     let mut handles = vec![];
 
     let writer = thread::spawn(move || {
-        for _ in 1..10 {
+        for _ in 1..20 {
             let mut rng = rand::thread_rng();
             let randomness = rng.gen_range(0..10);
 
             if randomness > 5 {
-                add(&borrowpool1, 1., 1000.);
-                add(&borrowpool2, 1., 1200.);
+                add(&safepool1, 1., 2000.);
+                add(&safepool2, 1., 1200.);
             } else {
-                remove(&borrowpool1, 1., 1000.);
-                remove(&borrowpool2, 1., 1200.);
+                remove(&safepool1, 0.2, 500.);
+                remove(&safepool2, 0.3, 600.);
             }
             thread::sleep(Duration::from_millis(1000));
         }
@@ -185,10 +164,42 @@ fn main() {
 
     let searcher = thread::spawn(move || {
         for _ in 1..10 {
-            let b1 = detect_arb(&Arc::clone(&pool1), &Arc::clone(&pool2), Token::Eth, 0.97);
-            let b2 = detect_arb(&Arc::clone(&pool2), &Arc::clone(&pool1), Token::Eth, 0.97);
-            println!("{:?}", b1);
-            println!("{:?}", b2);
+            let b1 = find_optimal_arb(
+                &Arc::clone(&pool1),
+                &Arc::clone(&pool2),
+                Token::Eth,
+                0.97,
+                2.,
+            );
+            let b2 = find_optimal_arb(
+                &Arc::clone(&pool2),
+                &Arc::clone(&pool1),
+                Token::Eth,
+                0.97,
+                2.,
+            );
+            println!(
+                "Profit from sending {:?}, {:?}",
+                b1,
+                detect_arb(
+                    &Arc::clone(&pool1),
+                    &Arc::clone(&pool2),
+                    Token::Eth,
+                    0.97,
+                    b1
+                ) - b1
+            );
+            println!(
+                "Profit from sending {:?}, {:?}",
+                b2,
+                detect_arb(
+                    &Arc::clone(&pool2),
+                    &Arc::clone(&pool1),
+                    Token::Eth,
+                    0.97,
+                    b2,
+                ) - b2
+            );
             thread::sleep(Duration::from_millis(2000));
         }
     });
@@ -197,5 +208,135 @@ fn main() {
     handles.push(searcher);
     for i in handles {
         i.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn initialize() {
+        let xx = 1000.;
+        let yy = 200.;
+        let pool = Pool {
+            token_x: Token::Eth,
+            token_y: Token::Dai,
+            x: RwLock::new(xx),
+            y: RwLock::new(yy),
+            k: RwLock::new(xx + yy),
+        };
+        let trader = Trader {
+            amt_eth: RwLock::new(xx),
+            amt_dai: RwLock::new(yy),
+        };
+
+        assert_eq!(*trader.amt_eth.read().unwrap(), 1000.);
+        assert_eq!(*trader.amt_dai.read().unwrap(), 200.);
+
+        assert_eq!(*pool.x.read().unwrap(), 1000.);
+        assert_eq!(*pool.y.read().unwrap(), 200.);
+    }
+
+    #[test]
+    fn add_and_remove() {
+        let xx = 1000.;
+        let yy = 200.;
+        let pool = Arc::new(Pool {
+            token_x: Token::Eth,
+            token_y: Token::Dai,
+            x: RwLock::new(xx),
+            y: RwLock::new(yy),
+            k: RwLock::new(xx + yy),
+        });
+
+        let safepool = Arc::clone(&pool);
+
+        add(&safepool, 4., 4.);
+        assert_eq!(*Arc::clone(&pool).x.read().unwrap(), 1004.);
+        assert_eq!(*Arc::clone(&pool).y.read().unwrap(), 204.);
+    }
+
+    #[test]
+    fn test_swap() {
+        let xx = 1000.;
+        let yy = 200.;
+        let pool = Pool {
+            token_x: Token::Eth,
+            token_y: Token::Dai,
+            x: RwLock::new(xx),
+            y: RwLock::new(yy),
+            k: RwLock::new(xx + yy),
+        };
+        let mut trader = Trader {
+            amt_eth: RwLock::new(xx),
+            amt_dai: RwLock::new(yy),
+        };
+        swap(&mut trader, &pool, Token::Eth, 1., 0.03);
+
+        assert_eq!(*trader.amt_eth.read().unwrap(), 999.);
+        assert_eq!(*trader.amt_dai.read().unwrap(), 200.194);
+    }
+
+    #[test]
+
+    fn find_optimal_amount() {
+        let pool1 = Arc::new(Pool {
+            token_x: Token::Eth,
+            token_y: Token::Dai,
+            x: RwLock::new(4.),
+            y: RwLock::new(3500.),
+            k: RwLock::new(3504.),
+        });
+        let pool2 = Arc::new(Pool {
+            token_x: Token::Eth,
+            token_y: Token::Dai,
+            x: RwLock::new(4.),
+            y: RwLock::new(4000.),
+            k: RwLock::new(4004.),
+        });
+
+        let b1 = find_optimal_arb(
+            &Arc::clone(&pool1),
+            &Arc::clone(&pool2),
+            Token::Eth,
+            0.97,
+            2.,
+        );
+        let b2 = find_optimal_arb(
+            &Arc::clone(&pool2),
+            &Arc::clone(&pool1),
+            Token::Eth,
+            0.97,
+            2.,
+        );
+        assert_eq!(b1, 1.9900000000000015);
+        assert_eq!(
+            detect_arb(
+                &Arc::clone(&pool1),
+                &Arc::clone(&pool2),
+                Token::Eth,
+                0.97,
+                b1
+            ) - b1,
+            0.14755301325556314
+        );
+        assert_eq!(b2, 0.);
+        assert_eq!(
+            detect_arb(
+                &Arc::clone(&pool1),
+                &Arc::clone(&pool2),
+                Token::Eth,
+                0.97,
+                b2
+            ) - b2,
+            0.
+        );
+    }
+
+    #[test]
+    fn benchmark_non_blocking_calculation() {
+        main()
     }
 }
