@@ -1,9 +1,7 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
 use rand::Rng;
-use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
