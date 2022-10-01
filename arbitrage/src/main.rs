@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 use rand::Rng;
 use std::cell::Cell;
+use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -15,32 +16,32 @@ enum Token {
 struct Pool {
     token_x: Token,
     token_y: Token,
-    x: Cell<f64>,
-    y: Cell<f64>,
-    k: Cell<f64>,
+    x: RwLock<f64>,
+    y: RwLock<f64>,
+    k: RwLock<f64>,
 }
 
 struct Trader {
-    amt_eth: Cell<f64>,
-    amt_dai: Cell<f64>,
+    amt_eth: RwLock<f64>,
+    amt_dai: RwLock<f64>,
 }
 
 fn add(pool: &Pool, add_to_x: f64, add_to_y: f64) {
-    pool.x.set(pool.x.get() + add_to_x);
-    pool.y.set(pool.y.get() + add_to_y);
-    pool.k.set(pool.y.get() + pool.x.get());
+    *pool.x.write().unwrap() += add_to_x;
+    *pool.y.write().unwrap() += add_to_y;
+    *pool.k.write().unwrap() = *pool.x.read().unwrap() + *pool.y.read().unwrap();
 }
 
 fn remove(pool: &Pool, rem_from_x: f64, rem_from_y: f64) {
-    pool.x.set(pool.x.get() - rem_from_x);
-    pool.y.set(pool.y.get() - rem_from_y);
-    pool.k.set(pool.y.get() + pool.x.get());
+    *pool.x.write().unwrap() -= rem_from_x;
+    *pool.y.write().unwrap() -= rem_from_y;
+    *pool.k.write().unwrap() = *pool.x.read().unwrap() + *pool.y.read().unwrap();
 }
 
 fn get_amount_out(amount_in: f64, pool: &Pool, token_in: Token, fee: f64) -> f64 {
     let amount_in_less_fee = amount_in * (1. - fee);
-    let py = pool.y.get();
-    let px = pool.x.get();
+    let py = *pool.y.read().unwrap();
+    let px = *pool.x.read().unwrap();
     if token_in == pool.token_x {
         let price = py / px;
         let amount_out = amount_in_less_fee * price;
@@ -64,20 +65,20 @@ fn get_amount_out(amount_in: f64, pool: &Pool, token_in: Token, fee: f64) -> f64
     }
 }
 
-fn swap(trader: &Trader, pool: &Pool, token_in: Token, amount_in: f64, fee: f64) {
-    let amt_eth = trader.amt_eth.get();
-    let amt_dai = trader.amt_dai.get();
+fn swap(trader: &mut Trader, pool: &Pool, token_in: Token, amount_in: f64, fee: f64) {
+    let amt_eth = *trader.amt_eth.read().unwrap();
+    let amt_dai = *trader.amt_dai.read().unwrap();
     if token_in == Token::Eth && amt_eth > amount_in {
         let amt_out = get_amount_out(amount_in, pool, token_in, fee);
         if amt_out > 0. {
-            trader.amt_eth.set(amt_eth - amount_in);
-            trader.amt_dai.set(amt_dai + amt_out);
+            *trader.amt_eth.write().unwrap() = amt_eth - amount_in;
+            *trader.amt_dai.write().unwrap() = amt_dai + amt_out;
         }
     } else if token_in == Token::Dai && amt_dai > amount_in {
         let amt_out = get_amount_out(amount_in, pool, token_in, fee);
         if amt_out > 0. {
-            trader.amt_eth.set(amt_eth + amt_out);
-            trader.amt_dai.set(amt_dai - amount_in);
+            *trader.amt_dai.write().unwrap() = amt_dai - amt_out;
+            *trader.amt_eth.write().unwrap() = amt_dai + amount_in;
         }
     }
 }
@@ -106,10 +107,10 @@ fn detect_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64) -> f64 {
     let is_x_1 = token_in == pool1.token_x;
     let is_x_2 = token_in == pool2.token_x;
 
-    let x1 = pool1.x.get();
-    let x2 = pool2.x.get();
-    let y1 = pool1.y.get();
-    let y2 = pool2.y.get();
+    let x1 = *pool1.x.read().unwrap();
+    let x2 = *pool2.x.read().unwrap();
+    let y1 = *pool1.y.read().unwrap();
+    let y2 = *pool2.y.read().unwrap();
 
     let amt_in = 1.;
 
@@ -128,62 +129,73 @@ fn main() {
     let yy = 200.;
     let kk = xx * yy;
 
-    let pool = Pool {
+    let mut pool = Pool {
         token_x: Token::Eth,
         token_y: Token::Dai,
-        x: Cell::new(xx),
-        y: Cell::new(yy),
-        k: Cell::new(kk),
+        x: RwLock::new(xx),
+        y: RwLock::new(yy),
+        k: RwLock::new(xx + yy),
     };
 
-    let trader = Trader {
-        amt_eth: Cell::new(xx),
-        amt_dai: Cell::new(yy),
+    let mut trader = Trader {
+        amt_eth: RwLock::new(xx),
+        amt_dai: RwLock::new(yy),
     };
 
-    pool.x.replace(5.);
+    add(&mut pool, 4., 4.);
 
-    add(&pool, 4., 4.);
+    swap(&mut trader, &mut pool, Token::Eth, 2., 0.03);
 
-    println!("{:?}", trader.amt_eth.get());
-    println!("{:?}", trader.amt_dai.get());
-
-    swap(&trader, &pool, Token::Eth, 2., 0.03);
-
-    println!("{:?}", trader.amt_eth.get());
-    println!("{:?}", trader.amt_dai.get());
-
-    let pool1 = Pool {
+    let pool1 = Arc::new(Pool {
         token_x: Token::Eth,
         token_y: Token::Dai,
-        x: Cell::new(4.),
-        y: Cell::new(3500.),
-        k: Cell::new(4000. + 4.),
-    };
+        x: RwLock::new(4.),
+        y: RwLock::new(3500.),
+        k: RwLock::new(3504.),
+    });
 
-    let pool2 = Pool {
+    let pool2 = Arc::new(Pool {
         token_x: Token::Eth,
         token_y: Token::Dai,
-        x: Cell::new(4.),
-        y: Cell::new(4000.),
-        k: Cell::new(3500. + 4.),
-    };
+        x: RwLock::new(4.),
+        y: RwLock::new(4000.),
+        k: RwLock::new(4004.),
+    });
 
-    let b1 = detect_arb(&pool2, &pool1, Token::Eth, 0.97);
-    let b2 = detect_arb(&pool1, &pool2, Token::Eth, 0.97);
+    let borrowpool1 = Arc::clone(&pool1);
+    let borrowpool2 = Arc::clone(&pool2);
 
-    // let handle = thread::spawn(|| {
-    //     for i in 1..100 {
-    //         let mut rng = rand::thread_rng();
-    //         let randomness = rng.gen_range(0..10);
+    let mut handles = vec![];
 
-    //         if randomness > 5 {
-    //             add(&pool1, 1., 1000.);
-    //             add(&pool2, 1., 1200.);
-    //         } else {
-    //             remove(&pool1, 1., 1000.);
-    //             remove(&pool2, 1., 1200.);
-    //         }
-    //     }
-    // });
+    let writer = thread::spawn(move || {
+        for _ in 1..10 {
+            let mut rng = rand::thread_rng();
+            let randomness = rng.gen_range(0..10);
+
+            if randomness > 5 {
+                add(&borrowpool1, 1., 1000.);
+                add(&borrowpool2, 1., 1200.);
+            } else {
+                remove(&borrowpool1, 1., 1000.);
+                remove(&borrowpool2, 1., 1200.);
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+    });
+
+    let searcher = thread::spawn(move || {
+        for _ in 1..10 {
+            let b1 = detect_arb(&Arc::clone(&pool1), &Arc::clone(&pool2), Token::Eth, 0.97);
+            let b2 = detect_arb(&Arc::clone(&pool2), &Arc::clone(&pool1), Token::Eth, 0.97);
+            println!("{:?}", b1);
+            println!("{:?}", b2);
+            thread::sleep(Duration::from_millis(2000));
+        }
+    });
+
+    handles.push(writer);
+    handles.push(searcher);
+    for i in handles {
+        i.join().unwrap();
+    }
 }
