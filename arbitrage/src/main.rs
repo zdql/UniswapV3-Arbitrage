@@ -1,9 +1,12 @@
 #![allow(dead_code)]
 use rand::Rng;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
+
+mod math;
 
 #[derive(PartialEq, Copy, Clone)]
 enum Token {
@@ -11,203 +14,202 @@ enum Token {
     Dai,
 }
 
-struct Pool {
-    token_x: Token,
-    token_y: Token,
-    x: RwLock<f64>,
-    y: RwLock<f64>,
-    k: RwLock<f64>,
+fn price_to_tick(price: f64) -> f64 {
+    price.log(1.001).floor()
+}
+
+fn price_to_sqrtp(price: f64) -> f64 {
+    price.sqrt() * math::get_q96()
+}
+
+fn liquidity0(amount: f64, pa: f64, pb: f64) -> f64 {
+    let q96 = math::get_q96();
+    if pa > pb {
+        return (amount * (pa * pb) / q96) / (pb - pa);
+    } else {
+        return (amount * (pb * pa) / q96) / (pa - pb);
+    }
+}
+
+fn liquidity1(amount: f64, pa: f64, pb: f64) -> f64 {
+    let q96 = math::get_q96();
+    if pa > pb {
+        return amount * q96 / (pb - pa);
+    } else {
+        return amount * q96 / (pa - pb);
+    }
+}
+
+fn calc_amount0(liq: f64, lower_tick: f64, upper_tick: f64) -> f64 {
+    let q96 = math::get_q96();
+
+    liq * q96 * (upper_tick - lower_tick) / lower_tick / upper_tick
+}
+
+fn calc_amount1(liq: f64, lower_tick: f64, upper_tick: f64) -> f64 {
+    liq * (upper_tick - lower_tick) / math::get_q96()
+}
+
+fn calc_price_diff(amount_in: f64, liquidity: f64) -> f64 {
+    (amount_in * math::get_q96()) / liquidity
+}
+
+struct Tick {
+    liquidity: RwLock<f64>,
+    initialized: RwLock<bool>,
+}
+
+struct Position {
+    liquidity: RwLock<f64>,
+}
+
+struct uniswap_v3_pool {
+    token_0: Token,
+    token_1: Token,
+    min_tick: i32,
+    max_tick: i32,
+    balance_0: RwLock<f64>,
+    balance_1: RwLock<f64>,
+    tick_mapping: RwLock<HashMap<i32, Tick>>,
+    liquidity_mapping: RwLock<HashMap<i32, f64>>,
+    position_mapping: RwLock<HashMap<i32, Position>>,
+    sqrt_price_x96: RwLock<f64>,
+    tick: RwLock<i32>,
+    liquidity: RwLock<f64>,
+}
+
+impl uniswap_v3_pool {
+    fn update(&mut self, tick: i32, liquidity_delta: f64) -> bool {
+        let default_tick = Tick {
+            liquidity: RwLock::new(0.),
+            initialized: RwLock::new(false),
+        };
+        let tick_map = &mut self.tick_mapping.write().unwrap();
+
+        let info = tick_map.entry(tick).or_insert(default_tick);
+
+        let liquidity_before = *info.liquidity.read().unwrap();
+
+        let liquidity_after = liquidity_before + liquidity_delta;
+
+        if liquidity_before == 0. {
+            *info.initialized.write().unwrap() = true;
+            self.liquidity_mapping
+                .write()
+                .unwrap()
+                .insert(tick, liquidity_after);
+        }
+
+        *info.liquidity.write().unwrap() = liquidity_after;
+
+        let flipped = (liquidity_after == 0.) != (liquidity_before == 0.);
+
+        flipped
+    }
+
+    fn mint(&mut self, owner: &Trader, lower_tick: i32, upper_tick: i32, amount: f64) {
+        if !(lower_tick >= upper_tick || lower_tick < self.min_tick || upper_tick > self.max_tick)
+            && amount != 0.
+        {
+            let flipped_lower = self.update(lower_tick, amount);
+            let flipped_upper = self.update(upper_tick, amount);
+
+            if flipped_lower {
+                self.liquidity_mapping
+                    .write()
+                    .unwrap()
+                    .insert(lower_tick, 1.);
+            }
+            if flipped_upper {
+                self.liquidity_mapping
+                    .write()
+                    .unwrap()
+                    .insert(upper_tick, 1.);
+            }
+
+            let default_position = Position {
+                liquidity: RwLock::new(0.),
+            };
+
+            let position_map = &mut self.position_mapping.write().unwrap();
+
+            let position = position_map.entry(owner.id).or_insert(default_position);
+
+            *position.liquidity.write().unwrap() += amount;
+
+            let amount0 = calc_amount0(
+                amount,
+                *self.sqrt_price_x96.read().unwrap(),
+                upper_tick.into(),
+            );
+            let amount1 = calc_amount1(
+                amount,
+                lower_tick.into(),
+                *self.sqrt_price_x96.read().unwrap(),
+            );
+
+            if amount0 > 0. {
+                *self.balance_0.write().unwrap() += amount0
+            }
+            if amount1 > 0. {
+                *self.balance_1.write().unwrap() += amount1
+            }
+            *self.liquidity.write().unwrap() += amount
+        }
+    }
+
+
+    fn next_initialized_tick(tick: i32, )
+}
+struct SwapState {
+    amount_specified_remaining: f64,
+    amount_calculated: f64,
+    sqrt_price_x96: f64,
+    tick: i32,
+}
+
+struct StepState {
+    sqrt_price_start_x96: f64,
+    next_tick: i32,
+    sqrt_price_next_x96: f64,
+    amount_in: f64,
+    amount_out: f64,
+}
+
+fn v3_swap(
+    trader: &mut Trader,
+    pool: &uniswap_v3_pool,
+    token_in: Token,
+    amount_specified: f64,
+    fee: f64,
+) {
+    let mut state = SwapState {
+        amount_specified_remaining: amount_specified,
+        amount_calculated: 0.,
+        sqrt_price_x96: *pool.sqrt_price_x96.read().unwrap(),
+        tick: *pool.tick.read().unwrap(),
+    };
+
+
+    while state.amount_specified_remaining > 0 {
+        let step = StepState { sqrt_price_start_x96: state.sqrt_price_x96,
+            next_tick: 
+        
+        
+        }
+    }
+
+
+
 }
 
 struct Trader {
+    id: i32,
     amt_eth: RwLock<f64>,
     amt_dai: RwLock<f64>,
 }
 
-fn add(pool: &Pool, add_to_x: f64, add_to_y: f64) {
-    *pool.x.write().unwrap() += add_to_x;
-    *pool.y.write().unwrap() += add_to_y;
-    *pool.k.write().unwrap() = *pool.x.read().unwrap() + *pool.y.read().unwrap();
-}
-
-fn remove(pool: &Pool, rem_from_x: f64, rem_from_y: f64) {
-    *pool.x.write().unwrap() -= rem_from_x;
-    *pool.y.write().unwrap() -= rem_from_y;
-    *pool.k.write().unwrap() = *pool.x.read().unwrap() + *pool.y.read().unwrap();
-}
-
-fn get_amount_out(amount_in: f64, pool: &Pool, token_in: Token, fee: f64) -> f64 {
-    let amount_in_less_fee = amount_in * (1. - fee);
-    let py = *pool.y.read().unwrap();
-    let px = *pool.x.read().unwrap();
-    if token_in == pool.token_x {
-        let price = py / px;
-        let amount_out = amount_in_less_fee * price;
-        if amount_out <= py {
-            remove(pool, 0., amount_out);
-            add(pool, amount_in, 0.);
-            return amount_out;
-        } else {
-            return 0.;
-        }
-    } else {
-        let price = px / py;
-        let amount_out = amount_in_less_fee * price;
-        if amount_out <= px {
-            remove(pool, amount_out, 0.);
-            add(pool, 0., amount_in);
-            return amount_out;
-        } else {
-            return 0.;
-        }
-    }
-}
-
-fn swap(trader: &mut Trader, pool: &Pool, token_in: Token, amount_in: f64, fee: f64) {
-    let amt_eth = *trader.amt_eth.read().unwrap();
-    let amt_dai = *trader.amt_dai.read().unwrap();
-    if token_in == Token::Eth && amt_eth > amount_in {
-        let amt_out = get_amount_out(amount_in, pool, token_in, fee);
-        if amt_out > 0. {
-            *trader.amt_eth.write().unwrap() = amt_eth - amount_in;
-            *trader.amt_dai.write().unwrap() = amt_dai + amt_out;
-        }
-    } else if token_in == Token::Dai && amt_dai > amount_in {
-        let amt_out = get_amount_out(amount_in, pool, token_in, fee);
-        if amt_out > 0. {
-            *trader.amt_dai.write().unwrap() = amt_dai - amt_out;
-            *trader.amt_eth.write().unwrap() = amt_dai + amount_in;
-        }
-    }
-}
-
-fn calc_two_pool_arb_profit(x_in: f64, xr1: f64, xr2: f64, yr1: f64, yr2: f64, fee: f64) -> f64 {
-    let s = (fee * xr1 * x_in) / (yr1 + (fee * x_in));
-    let n = fee * yr2 * s;
-    let d = xr2 + fee * s;
-    n / d
-}
-
-fn detect_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64, amt_in: f64) -> f64 {
-    let is_x_1 = token_in == pool1.token_x;
-    let is_x_2 = token_in == pool2.token_x;
-
-    let x1 = *pool1.x.read().unwrap();
-    let x2 = *pool2.x.read().unwrap();
-    let y1 = *pool1.y.read().unwrap();
-    let y2 = *pool2.y.read().unwrap();
-
-    let opt_amt = match (is_x_1, is_x_2) {
-        (true, true) => calc_two_pool_arb_profit(amt_in, x1, x2, y1, y2, fee),
-        (true, false) => calc_two_pool_arb_profit(amt_in, x1, y2, y1, x2, fee),
-        (false, false) => calc_two_pool_arb_profit(amt_in, y1, y2, x1, x2, fee),
-        (false, true) => calc_two_pool_arb_profit(amt_in, y1, x2, x1, y2, fee),
-    };
-
-    opt_amt
-}
-
-fn find_optimal_arb(pool1: &Pool, pool2: &Pool, token_in: Token, fee: f64, max_amt_in: f64) -> f64 {
-    let mut amt = 0.01;
-    let mut max_out = 0.;
-    let mut opt_amt = 0.;
-    while amt <= max_amt_in {
-        let amt_out = detect_arb(pool1, pool2, token_in.clone(), fee, amt) - amt;
-        if amt_out > max_out {
-            max_out = amt_out;
-            opt_amt = amt;
-        }
-        amt += 0.01;
-    }
-    opt_amt
-}
-
-fn main() {
-    let pool1 = Arc::new(Pool {
-        token_x: Token::Eth,
-        token_y: Token::Dai,
-        x: RwLock::new(4.),
-        y: RwLock::new(3500.),
-        k: RwLock::new(3504.),
-    });
-
-    let pool2 = Arc::new(Pool {
-        token_x: Token::Eth,
-        token_y: Token::Dai,
-        x: RwLock::new(4.),
-        y: RwLock::new(4000.),
-        k: RwLock::new(4004.),
-    });
-
-    let safepool1 = Arc::clone(&pool1);
-    let safepool2 = Arc::clone(&pool2);
-
-    let mut handles = vec![];
-
-    let writer = thread::spawn(move || {
-        for _ in 1..20 {
-            let mut rng = rand::thread_rng();
-            let randomness = rng.gen_range(0..10);
-
-            if randomness > 5 {
-                add(&safepool1, 1., 2000.);
-                add(&safepool2, 1., 1200.);
-            } else {
-                remove(&safepool1, 0.2, 500.);
-                remove(&safepool2, 0.3, 600.);
-            }
-            thread::sleep(Duration::from_millis(1000));
-        }
-    });
-
-    let searcher = thread::spawn(move || {
-        for _ in 1..10 {
-            let b1 = find_optimal_arb(
-                &Arc::clone(&pool1),
-                &Arc::clone(&pool2),
-                Token::Eth,
-                0.97,
-                2.,
-            );
-            let b2 = find_optimal_arb(
-                &Arc::clone(&pool2),
-                &Arc::clone(&pool1),
-                Token::Eth,
-                0.97,
-                2.,
-            );
-            println!(
-                "Profit from sending {:?}, {:?}",
-                b1,
-                detect_arb(
-                    &Arc::clone(&pool1),
-                    &Arc::clone(&pool2),
-                    Token::Eth,
-                    0.97,
-                    b1
-                ) - b1
-            );
-            println!(
-                "Profit from sending {:?}, {:?}",
-                b2,
-                detect_arb(
-                    &Arc::clone(&pool2),
-                    &Arc::clone(&pool1),
-                    Token::Eth,
-                    0.97,
-                    b2,
-                ) - b2
-            );
-            thread::sleep(Duration::from_millis(2000));
-        }
-    });
-
-    handles.push(writer);
-    handles.push(searcher);
-    for i in handles {
-        i.join().unwrap();
-    }
-}
+fn main() {}
 
 #[cfg(test)]
 mod tests {
@@ -215,126 +217,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialize() {
-        let xx = 1000.;
-        let yy = 200.;
-        let pool = Pool {
-            token_x: Token::Eth,
-            token_y: Token::Dai,
-            x: RwLock::new(xx),
-            y: RwLock::new(yy),
-            k: RwLock::new(xx + yy),
-        };
+    fn price_to_sqrt_price() {
+        assert_eq!(price_to_sqrtp(5000.), 5.602277097478614e30);
+    }
+
+    #[test]
+    fn v3_test_mint() {
         let trader = Trader {
-            amt_eth: RwLock::new(xx),
-            amt_dai: RwLock::new(yy),
+            id: 2,
+            amt_eth: RwLock::new(2000.),
+            amt_dai: RwLock::new(10000.),
+        };
+        let mut pool = uniswap_v3_pool {
+            liquidity: RwLock::new(0.),
+            max_tick: math::get_max_tick(),
+            min_tick: math::get_min_tick(),
+            position_mapping: RwLock::new(HashMap::new()),
+            tick_mapping: RwLock::new(HashMap::new()),
+            liquidity_mapping: RwLock::new(HashMap::new()),
+            sqrt_price_x96: RwLock::new(5602277097478614198912276234240.),
+            tick: RwLock::new(85176),
+            token_0: Token::Eth,
+            token_1: Token::Dai,
+            balance_0: RwLock::new(0.),
+            balance_1: RwLock::new(0.),
         };
 
-        assert_eq!(*trader.amt_eth.read().unwrap(), 1000.);
-        assert_eq!(*trader.amt_dai.read().unwrap(), 200.);
+        pool.mint(&trader, 84222, 86129, 1517882343751509868544.);
 
-        assert_eq!(*pool.x.read().unwrap(), 1000.);
-        assert_eq!(*pool.y.read().unwrap(), 200.);
-    }
-
-    #[test]
-    fn add_and_remove() {
-        let xx = 1000.;
-        let yy = 200.;
-        let pool = Arc::new(Pool {
-            token_x: Token::Eth,
-            token_y: Token::Dai,
-            x: RwLock::new(xx),
-            y: RwLock::new(yy),
-            k: RwLock::new(xx + yy),
-        });
-
-        let safepool = Arc::clone(&pool);
-
-        add(&safepool, 4., 4.);
-        assert_eq!(*Arc::clone(&pool).x.read().unwrap(), 1004.);
-        assert_eq!(*Arc::clone(&pool).y.read().unwrap(), 204.);
-    }
-
-    #[test]
-    fn test_swap() {
-        let xx = 1000.;
-        let yy = 200.;
-        let pool = Pool {
-            token_x: Token::Eth,
-            token_y: Token::Dai,
-            x: RwLock::new(xx),
-            y: RwLock::new(yy),
-            k: RwLock::new(xx + yy),
-        };
-        let mut trader = Trader {
-            amt_eth: RwLock::new(xx),
-            amt_dai: RwLock::new(yy),
-        };
-        swap(&mut trader, &pool, Token::Eth, 1., 0.03);
-
-        assert_eq!(*trader.amt_eth.read().unwrap(), 999.);
-        assert_eq!(*trader.amt_dai.read().unwrap(), 200.194);
-    }
-
-    #[test]
-
-    fn find_optimal_amount() {
-        let pool1 = Arc::new(Pool {
-            token_x: Token::Eth,
-            token_y: Token::Dai,
-            x: RwLock::new(4.),
-            y: RwLock::new(3500.),
-            k: RwLock::new(3504.),
-        });
-        let pool2 = Arc::new(Pool {
-            token_x: Token::Eth,
-            token_y: Token::Dai,
-            x: RwLock::new(4.),
-            y: RwLock::new(4000.),
-            k: RwLock::new(4004.),
-        });
-
-        let b1 = find_optimal_arb(
-            &Arc::clone(&pool1),
-            &Arc::clone(&pool2),
-            Token::Eth,
-            0.97,
-            2.,
-        );
-        let b2 = find_optimal_arb(
-            &Arc::clone(&pool2),
-            &Arc::clone(&pool1),
-            Token::Eth,
-            0.97,
-            2.,
-        );
-        assert_eq!(b1, 1.9900000000000015);
+        println!("{:?}", pool.balance_0);
+        println!("{:?}", pool.balance_1);
+        assert_eq!(*pool.liquidity.read().unwrap(), 1517882343751509868544.);
         assert_eq!(
-            detect_arb(
-                &Arc::clone(&pool1),
-                &Arc::clone(&pool2),
-                Token::Eth,
-                0.97,
-                b1
-            ) - b1,
-            0.14755301325556314
+            *pool.sqrt_price_x96.read().unwrap(),
+            5602277097478614198912276234240.0
         );
-        assert_eq!(b2, 0.);
-        assert_eq!(
-            detect_arb(
-                &Arc::clone(&pool1),
-                &Arc::clone(&pool2),
-                Token::Eth,
-                0.97,
-                b2
-            ) - b2,
-            0.
-        );
-    }
-
-    #[test]
-    fn benchmark_non_blocking_calculation() {
-        main()
     }
 }
