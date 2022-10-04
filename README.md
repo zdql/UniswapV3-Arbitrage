@@ -1,12 +1,13 @@
-# UniswapV3-Arbitrage
+# Uniswap-Arbitrage-Simulation
 
 Uniswap V3 and V2 example arbitrage calculation.
+
 
 The Uniswap V3 simulation can be found in src/main.rs. The Uniswap V2 simulation can be found in src/bin/v2.rs.
 
 We create structs to represent pools and a trader. We define and test functions to add, remove, and swap between pools and update both structs.\
 
-The arbitrage logic is derived from the formula to calculate the amount received by swapping an asset into a pool.
+For V2, The arbitrage logic is derived from the formula to calculate the amount received by swapping an asset into a pool.
 
 For uniswap v2, with reserves X, Y, fee F, and amount in x, the formula to calculate the amount of asset y you recieve is
 
